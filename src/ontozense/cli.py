@@ -2,11 +2,35 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import typer
 from rich.console import Console
 from rich.table import Table
+
+
+def _ensure_utf8_stdio() -> None:
+    """Reconfigure stdout/stderr to UTF-8 on Windows so Rich-rendered
+    output doesn't crash on cp1252 consoles. Safe no-op on systems
+    where stdio is already UTF-8. Called at module import so every
+    CLI invocation benefits.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            if (stream.encoding or "").lower().replace("-", "") != "utf8":
+                reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            # Some environments (e.g. CI capturing streams) refuse to
+            # reconfigure. Errors="replace" in the CLI output handlers
+            # is our backup.
+            pass
+
+
+_ensure_utf8_stdio()
 
 app = typer.Typer(
     name="ontozense",
@@ -130,7 +154,7 @@ def ingest(
     # Per-file detail
     for d in decisions:
         primary = d.primary_source.value
-        marker = "↓" if d.is_skip else "→"
+        marker = "v" if d.is_skip else "->"
         sources_str = "+".join(s.value for s in d.sources)
         console.print(
             f"  [bold]{marker}[/] [cyan]{sources_str:>6}[/] "
@@ -173,12 +197,12 @@ def ingest(
         console.print()
         console.print(
             f"[yellow]Skipped {len(low_confidence)} low-confidence decision(s) "
-            f"(confidence ≤ {auto_threshold:.2f}):[/]"
+            f"(confidence <= {auto_threshold:.2f}):[/]"
         )
         for d in low_confidence:
             sources_str = "+".join(s.value for s in d.sources)
             console.print(
-                f"  [dim]•[/] [cyan]{sources_str}[/] "
+                f"  [dim]*[/] [cyan]{sources_str}[/] "
                 f"[dim]({d.confidence:.0%})[/] {d.file_path.name}"
             )
             if domain_dir:
@@ -245,7 +269,7 @@ def ingest(
                 f"{src.value} — auto-dispatch not yet implemented.[/]"
             )
             for fp in buckets[src]:
-                console.print(f"  [dim]•[/] {fp.name}")
+                console.print(f"  [dim]*[/] {fp.name}")
 
 
 # ─── extract-a (Source A: domain documents) ───────────────────────────────────
@@ -347,7 +371,39 @@ def extract_a(
                 )
             raise typer.Exit(code=1)
         console.print(f"[bold blue]Extracting from:[/] {doc}")
-        result = extractor.extract_from_file(doc)
+        try:
+            result = extractor.extract_from_file(doc)
+        except Exception as e:
+            # Surface a clean error to the tester instead of a raw
+            # traceback. Common causes: Azure auth failure, OntoGPT
+            # subprocess error, template not found.
+            err_msg = str(e)
+            console.print(f"[bold red][x] Extraction failed for {doc.name}[/]")
+            console.print(f"  [dim]{type(e).__name__}: {err_msg[:500]}[/]")
+            if "api" in err_msg.lower() or "auth" in err_msg.lower() or "credential" in err_msg.lower():
+                console.print(
+                    "  [yellow]Likely an Azure OpenAI credential issue. "
+                    "Check AZURE_API_KEY, AZURE_API_BASE, AZURE_API_VERSION "
+                    "in your .env file.[/]"
+                )
+            elif "ontogpt" in err_msg.lower() or "subprocess" in err_msg.lower():
+                console.print(
+                    "  [yellow]OntoGPT subprocess failed. Verify 'ontogpt' "
+                    "is installed in the active venv: pip show ontogpt[/]"
+                )
+            elif "template" in err_msg.lower() or "linkml" in err_msg.lower():
+                console.print(
+                    "  [yellow]LinkML template issue. The default template "
+                    "should exist at src/ontozense/templates/[/]"
+                )
+            if domain_dir:
+                append_log(
+                    domain_dir, "extract-a-failed",
+                    source=doc.name,
+                    error=type(e).__name__,
+                    message=err_msg[:200],
+                )
+            raise typer.Exit(code=1)
 
         # Optional: enrich with regex-found definitions and add unmatched
         # regex finds as additional regex-only candidate concepts.
@@ -361,7 +417,7 @@ def extract_a(
 
         if not result.concepts:
             console.print(
-                f"  [yellow]⚠ Warning:[/] no concepts extracted from {doc.name}."
+                f"  [yellow][!] Warning:[/] no concepts extracted from {doc.name}."
             )
             if domain_dir:
                 append_log(
@@ -436,11 +492,11 @@ def extract_a(
     if total_concepts == 0 and total_rels == 0:
         console.print()
         console.print(
-            "[bold red]✗ Extraction produced 0 concepts and 0 relationships.[/]\n"
+            "[bold red][x] Extraction produced 0 concepts and 0 relationships.[/]\n"
             "  No output written. Possible causes:\n"
-            "    • OntoGPT failed silently (check Azure OpenAI credentials in .env)\n"
-            "    • The documents contain no definitional content\n"
-            "    • The LinkML template is mismatched to the document format\n"
+            "    * OntoGPT failed silently (check Azure OpenAI credentials in .env)\n"
+            "    * The documents contain no definitional content\n"
+            "    * The LinkML template is mismatched to the document format\n"
             "  To debug, run OntoGPT directly:\n"
             "    ontogpt extract -i <document> -t <template> -m <model> -O json"
         )
@@ -467,7 +523,7 @@ def extract_a(
     if total_elements > 0 and high_conf == 0:
         console.print()
         console.print(
-            f"[bold yellow]⚠ All {total_elements} extracted elements "
+            f"[bold yellow][!] All {total_elements} extracted elements "
             f"({total_concepts} concepts + {total_rels} relationships) "
             f"have confidence < 50%.[/]\n"
             "  Output will be written but should be discarded or re-run."
@@ -512,19 +568,705 @@ def extract_a(
     console.print()
     console.print(f"[bold]Concepts:[/] {total_concepts}")
     console.print(
-        f"  [green]high (≥80%)[/]: {sum(1 for c in merged.concepts if c.overall_confidence() >= 0.8)}   "
+        f"  [green]high (>=80%)[/]: {sum(1 for c in merged.concepts if c.overall_confidence() >= 0.8)}   "
         f"[yellow]mid (50-79%)[/]: {sum(1 for c in merged.concepts if 0.5 <= c.overall_confidence() < 0.8)}   "
         f"[red]low (<50%)[/]: {sum(1 for c in merged.concepts if c.overall_confidence() < 0.5)}"
     )
     console.print(f"[bold]Relationships:[/] {total_rels}")
     console.print(
-        f"  [green]high (≥80%)[/]: {sum(1 for r in merged.relationships if r.overall_confidence() >= 0.8)}   "
+        f"  [green]high (>=80%)[/]: {sum(1 for r in merged.relationships if r.overall_confidence() >= 0.8)}   "
         f"[yellow]mid (50-79%)[/]: {sum(1 for r in merged.relationships if 0.5 <= r.overall_confidence() < 0.8)}   "
         f"[red]low (<50%)[/]: {sum(1 for r in merged.relationships if r.overall_confidence() < 0.5)}"
     )
 
     if total_elements > 0 and high_conf == 0:
         raise typer.Exit(code=3)
+
+
+# ─── suggest-bridges (LLM-suggested bridging for structural gaps) ────────────
+
+
+@app.command(name="suggest-bridges")
+def suggest_bridges_cmd(
+    fused_json: Path = typer.Argument(
+        ...,
+        help="Path to a fused dictionary JSON (output of the fuse command).",
+    ),
+    output: Path = typer.Option(
+        None, "--output", "-o",
+        help="Save suggestions as a markdown file (for file-back).",
+    ),
+    model: str = typer.Option(
+        "azure/gpt-5.4", "--model", "-m",
+        help="LLM model for litellm (e.g. 'azure/gpt-5.4', 'openai/gpt-4o').",
+    ),
+    domain_dir: Path = typer.Option(
+        None, "--domain-dir",
+        help="Per-domain knowledge base directory for audit log and auto file-back.",
+    ),
+    max_gaps: int = typer.Option(
+        5, "--max-gaps",
+        help="Maximum number of structural gaps to send to the LLM "
+             "(worst first by density). Each gap becomes one LLM call. "
+             "Default 5 keeps cost bounded.",
+    ),
+) -> None:
+    """Suggest bridging concepts for structural gaps using an LLM.
+
+    First runs structural gap analysis from the lint layer. For each
+    gap (up to --max-gaps), constructs a targeted prompt with the two
+    disconnected clusters and their definitions, then asks the LLM to
+    suggest bridging relationships.
+
+    Each gap triggers one LLM call, so the default cap of 5 gaps keeps
+    cost bounded. Raise --max-gaps to explore more gaps; lower it to
+    save on LLM calls.
+
+    Output is markdown suitable for ``ontozense file-back``.
+    """
+    import json
+    from .core.lint import _build_concept_graph, _find_structural_holes
+    from .core.bridging import suggest_bridges, format_suggestions_markdown
+    from .log import append_log
+
+    _load_env()
+
+    if not fused_json.exists():
+        console.print(f"[red]File not found:[/] {fused_json}")
+        raise typer.Exit(code=1)
+
+    raw = json.loads(fused_json.read_text(encoding="utf-8"))
+    fusion_result = _reconstruct_fusion_result(raw)
+
+    # Build graph and find structural holes
+    if len(fusion_result.relationships) == 0:
+        console.print("[yellow]No relationships in the fused output - "
+                      "structural gap analysis requires relationships.[/]")
+        raise typer.Exit(code=0)
+
+    G = _build_concept_graph(fusion_result)
+    if len(G.nodes) < 3:
+        console.print("[yellow]Too few elements for structural analysis.[/]")
+        raise typer.Exit(code=0)
+
+    import networkx as nx
+    from networkx.algorithms.community import greedy_modularity_communities
+
+    communities = list(greedy_modularity_communities(G))
+    holes = _find_structural_holes(G, communities)
+
+    if not holes:
+        console.print("[bold green]No structural gaps found - "
+                      "the knowledge graph is well-connected.[/]")
+        raise typer.Exit(code=0)
+
+    # Sort by severity (worst first) and cap to max_gaps
+    holes_sorted = sorted(
+        holes,
+        key=lambda h: (h[3], -(len(h[0]) + len(h[1]))),
+    )
+    total_holes = len(holes_sorted)
+    holes_to_process = holes_sorted[:max_gaps]
+
+    console.print(
+        f"[bold magenta]Found {total_holes} structural gap(s). "
+        f"Asking LLM about the worst {len(holes_to_process)} "
+        f"({len(holes_to_process)} LLM call(s))...[/]"
+    )
+    if total_holes > max_gaps:
+        console.print(
+            f"[dim]{total_holes - max_gaps} additional gap(s) not sent to "
+            f"the LLM. Raise --max-gaps to include more.[/]"
+        )
+
+    # Build definitions dict for the prompt
+    element_definitions = {
+        el.element_name: el.definition
+        for el in fusion_result.elements
+    }
+
+    # Convert capped holes to (community_a, community_b) pairs
+    hole_pairs = [(a, b) for a, b, _, _ in holes_to_process]
+
+    try:
+        suggestions = suggest_bridges(
+            hole_pairs, element_definitions, model=model,
+        )
+    except Exception as e:
+        error_msg = str(e)
+        if "auth" in error_msg.lower() or "api" in error_msg.lower():
+            console.print(
+                f"[red]LLM authentication failed.[/] Check your API key.\n"
+                f"  Set AZURE_API_KEY in .env (or the key your model requires).\n"
+                f"  Error: {error_msg}"
+            )
+        else:
+            console.print(f"[red]LLM call failed:[/] {error_msg}")
+        raise typer.Exit(code=1)
+
+    md = format_suggestions_markdown(suggestions)
+    console.print()
+    console.print(md)
+
+    if output:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(md, encoding="utf-8")
+        console.print(f"[bold green]Saved:[/] {output}")
+
+        if domain_dir:
+            from .core.fileback import file_back
+            dest = file_back(output, domain_dir, category="analyses")
+            console.print(
+                f"[bold green]Filed back:[/] {dest.relative_to(domain_dir)}"
+            )
+
+    if domain_dir:
+        append_log(
+            domain_dir, "suggest-bridges",
+            source=fused_json.name,
+            gaps=len(holes),
+            suggestions=len(suggestions),
+            model=model,
+        )
+
+
+# ─── query (Step 8: look up elements in fused output) ────────────────────────
+
+
+@app.command()
+def query(
+    term: str = typer.Argument(
+        ...,
+        help="Element name to look up, or a search term to find matching elements.",
+    ),
+    fused_json: Path = typer.Option(
+        ..., "--fused", "-f",
+        help="Path to a fused dictionary JSON (output of the fuse command).",
+    ),
+    output: Path = typer.Option(
+        None, "--output", "-o",
+        help="Save the query result as a markdown file (for file-back).",
+    ),
+    domain_dir: Path = typer.Option(
+        None, "--domain-dir",
+        help="Per-domain knowledge base directory. When combined with "
+             "--output, automatically files back the result.",
+    ),
+) -> None:
+    """Query the fused data dictionary for an element or search term.
+
+    Looks up a single element by name (exact, case-insensitive) or
+    searches for all elements containing the term. Renders a rich
+    markdown view showing all fields, sources, conflicts, business
+    rules, and relationships.
+
+    With --output, saves the result as a markdown file. With both
+    --output and --domain-dir, automatically files it back into
+    <domain-dir>/derived/analyses/ and logs the operation.
+    """
+    import json
+    from .core.fusion import (
+        FusedElement,
+        FusedRelationship,
+        FieldConflict,
+        FieldProvenance,
+        FusionResult,
+    )
+    from .core.query import query_element, search_elements, render_search_results
+    from .log import append_log
+
+    if not fused_json.exists():
+        console.print(f"[red]File not found:[/] {fused_json}")
+        raise typer.Exit(code=1)
+
+    raw = json.loads(fused_json.read_text(encoding="utf-8"))
+    fusion_result = _reconstruct_fusion_result(raw)
+
+    # Try exact lookup first
+    md = query_element(fusion_result, term)
+    if md is None:
+        # Fall back to search
+        matches = search_elements(fusion_result, term)
+        if not matches:
+            console.print(f"[yellow]No elements found matching '{term}'.[/]")
+            raise typer.Exit(code=0)
+        md = render_search_results(matches, term, fusion_result)
+
+    console.print(md)
+
+    if output:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(md, encoding="utf-8")
+        console.print(f"\n[bold green]Saved:[/] {output}")
+
+        # Auto file-back if domain-dir is also provided
+        if domain_dir:
+            from .core.fileback import file_back
+            dest = file_back(output, domain_dir, category="analyses")
+            console.print(
+                f"[bold green]Filed back:[/] {dest.relative_to(domain_dir)}"
+            )
+
+
+# ─── file-back (Step 8: save derived artifact) ──────────────────────────────
+
+
+@app.command(name="file-back")
+def file_back_cmd(
+    source_file: Path = typer.Argument(
+        ...,
+        help="The file to file back (markdown, CSV, Excel, ...).",
+    ),
+    domain_dir: Path = typer.Option(
+        ..., "--domain-dir",
+        help="Per-domain knowledge base directory.",
+    ),
+    category: str = typer.Option(
+        "analyses", "--category",
+        help="Sub-directory under derived/ (default: 'analyses').",
+    ),
+) -> None:
+    """File a derived artifact back into the domain knowledge base.
+
+    Copies the file to <domain-dir>/derived/<category>/<filename> and
+    appends a log entry. If a file with the same name already exists,
+    a timestamp suffix is added to avoid overwriting.
+
+    This is the Karpathy 'LLM Wiki' pattern: human-curated artifacts
+    (expert reviews, annotated comparisons, corrected definitions)
+    accumulate in the knowledge base alongside automated extractions.
+    """
+    from .core.fileback import file_back
+
+    if not source_file.exists():
+        console.print(f"[red]File not found:[/] {source_file}")
+        raise typer.Exit(code=1)
+
+    dest = file_back(source_file, domain_dir, category=category)
+    console.print(
+        f"[bold green]Filed back:[/] {dest.relative_to(domain_dir)}"
+    )
+    console.print(f"[dim]Log entry appended to {domain_dir / 'log.md'}[/]")
+
+
+# ─── Helper: reconstruct FusionResult from JSON ─────────────────────────────
+
+
+def _reconstruct_fusion_result(raw: dict) -> "FusionResult":
+    """Reconstruct a FusionResult from the fused JSON output.
+
+    Used by both the lint and query CLI commands. Centralised here to
+    avoid duplicating the reconstruction logic.
+    """
+    from .core.fusion import (
+        FusedElement,
+        FusedRelationship,
+        FieldConflict,
+        FieldProvenance,
+        FusionResult,
+    )
+
+    elements = []
+    for re_ in raw.get("elements", []):
+        el = FusedElement(
+            element_name=re_.get("element_name", ""),
+            domain_name=re_.get("domain_name", ""),
+            definition=re_.get("definition", ""),
+            is_critical=re_.get("is_critical", False),
+            citation=re_.get("citation", ""),
+            data_type=re_.get("data_type", ""),
+            enum_values=re_.get("enum_values", []),
+            business_rules=re_.get("business_rules", []),
+            extra_fields=re_.get("extra_fields", {}),
+            sources=re_.get("sources", []),
+            governance_validated=re_.get("governance_validated", False),
+            confidence=re_.get("confidence", 0.0),
+        )
+        for rc in re_.get("conflicts", []):
+            w = rc.get("winner", {})
+            el.conflicts.append(FieldConflict(
+                field_name=rc.get("field", ""),
+                winner=FieldProvenance(
+                    source=w.get("source", ""),
+                    confidence=0.0,
+                    original_value=w.get("value", ""),
+                ),
+                rejected=[
+                    FieldProvenance(
+                        source=rj.get("source", ""),
+                        confidence=0.0,
+                        original_value=rj.get("value", ""),
+                    )
+                    for rj in rc.get("rejected", [])
+                ],
+                resolution=rc.get("resolution", ""),
+            ))
+        elements.append(el)
+
+    relationships = []
+    for rr in raw.get("relationships", []):
+        relationships.append(FusedRelationship(
+            subject=rr.get("subject", ""),
+            predicate=rr.get("predicate", ""),
+            object=rr.get("object", ""),
+            source=rr.get("source", ""),
+            confidence=rr.get("confidence", 0.0),
+        ))
+
+    return FusionResult(
+        elements=elements,
+        relationships=relationships,
+        sources_used=raw.get("sources_used", []),
+        fusion_timestamp=raw.get("fusion_timestamp", ""),
+    )
+
+
+# ─── lint (Step 7: consistency check on fused output) ────────────────────────
+
+
+@app.command()
+def lint(
+    fused_json: Path = typer.Argument(
+        ...,
+        help="Path to a fused dictionary JSON (output of the fuse command).",
+    ),
+    domain_dir: Path = typer.Option(
+        None, "--domain-dir",
+        help="Per-domain knowledge base directory for audit log.",
+    ),
+    max_gaps: int = typer.Option(
+        10, "--max-gaps",
+        help="Maximum number of structural gap warnings to report. "
+             "Extra gaps are summarised (default: 10).",
+    ),
+    max_bridges: int = typer.Option(
+        10, "--max-bridges",
+        help="Maximum number of bridge concept findings to report. "
+             "Extra bridges are summarised (default: 10).",
+    ),
+) -> None:
+    """Run consistency checks on a fused data dictionary.
+
+    Checks for contradictions between sources, orphan terms not
+    referenced by any relationship, undefined relationship endpoints,
+    coverage gaps (missing definitions or citations), and structural
+    gaps (disconnected concept clusters via graph analysis).
+    """
+    import json
+    from .core.lint import lint as run_lint
+    from .log import append_log
+
+    if not fused_json.exists():
+        console.print(f"[red]File not found:[/] {fused_json}")
+        raise typer.Exit(code=1)
+
+    raw = json.loads(fused_json.read_text(encoding="utf-8"))
+    fusion_result = _reconstruct_fusion_result(raw)
+
+    # Run lint
+    report = run_lint(fusion_result, max_gaps=max_gaps, max_bridges=max_bridges)
+
+    # Display results
+    console.print()
+    console.print(f"[bold]Lint report for[/] {fused_json.name}")
+    console.print(
+        f"  Elements: {len(fusion_result.elements)}   "
+        f"Relationships: {len(fusion_result.relationships)}   "
+        f"Sources: {'+'.join(fusion_result.sources_used)}"
+    )
+    console.print()
+
+    if not report.findings:
+        console.print("[bold green]No issues found.[/]")
+    else:
+        # Group by category
+        for category in ["contradiction", "undefined_used", "orphan", "coverage_gap", "structural_gap"]:
+            findings = report.by_category(category)
+            if not findings:
+                continue
+            label = {
+                "contradiction": "Contradictions",
+                "undefined_used": "Undefined but used",
+                "orphan": "Orphan terms",
+                "coverage_gap": "Coverage gaps",
+                "structural_gap": "Structural gaps",
+            }[category]
+            color = {
+                "contradiction": "red",
+                "undefined_used": "yellow",
+                "orphan": "cyan",
+                "coverage_gap": "yellow",
+                "structural_gap": "magenta",
+            }[category]
+            console.print(f"[bold {color}]{label} ({len(findings)}):[/]")
+            for f in findings:
+                icon = {"error": "x", "warning": "!", "info": "-"}[f.severity]
+                console.print(f"  [{f.severity}] {icon} {f.message}")
+            console.print()
+
+    summary = report.summary
+    console.print(
+        f"[bold]Summary:[/] "
+        f"{report.error_count} errors, "
+        f"{report.warning_count} warnings, "
+        f"{len(report.findings) - report.error_count - report.warning_count} info"
+    )
+
+    if domain_dir:
+        append_log(
+            domain_dir, "lint",
+            source=fused_json.name,
+            **{k: v for k, v in summary.items()},
+            errors=report.error_count,
+            warnings=report.warning_count,
+        )
+
+    # Exit code reflects lint severity
+    if report.error_count > 0:
+        raise typer.Exit(code=1)
+
+
+# ─── fuse (Step 6: combine sources into rich data dictionary) ────────────────
+
+
+@app.command()
+def fuse(
+    source_a_json: Path = typer.Option(
+        None, "--source-a", "-a",
+        help="Source A extraction result (JSON from extract-a --json).",
+    ),
+    source_b_json: Path = typer.Option(
+        None, "--source-b", "-b",
+        help="Source B governance reference file (JSON).",
+    ),
+    source_c_dir: Path = typer.Option(
+        None, "--source-c", "-c",
+        help="Source C schema: path to a Django models directory.",
+    ),
+    source_d_dir: Path = typer.Option(
+        None, "--source-d", "-d",
+        help="Source D code: path to a directory of Python/SQL files.",
+    ),
+    output: Path = typer.Option(
+        "fused-dictionary.json",
+        "--output", "-o",
+        help="Output JSON file for the fused rich data dictionary.",
+    ),
+    domain_dir: Path = typer.Option(
+        None, "--domain-dir",
+        help="Per-domain knowledge base directory for audit log.",
+    ),
+    priority: str = typer.Option(
+        "A,B,C,D", "--priority",
+        help="Conflict resolution priority order (comma-separated).",
+    ),
+) -> None:
+    """Fuse Sources A, B, C, D into a rich data dictionary.
+
+    Takes extraction results from individual sources and combines them
+    into a single fused output with per-field provenance, governance
+    validation status, conflict detection, and confidence scoring.
+
+    At least one source must be provided. All sources are optional —
+    the minimum viable fusion is Source A alone.
+    """
+    import json
+    from dataclasses import asdict
+    from .core.fusion import FusionEngine
+    from .log import append_log
+
+    # ── Load sources ──
+    sa = sb = sc = sd = None
+
+    if source_a_json:
+        from .extractors.domain_doc_extractor import (
+            Concept,
+            DomainDocumentExtractionResult,
+            FieldConfidence,
+            Provenance,
+            Relationship,
+        )
+        raw = json.loads(source_a_json.read_text(encoding="utf-8"))
+        # Reconstruct from JSON (extract-a --json output)
+        concepts = []
+        for rc in raw.get("concepts", []):
+            c = Concept(
+                name=rc.get("name", ""),
+                definition=rc.get("definition", ""),
+                citation=rc.get("citation", ""),
+            )
+            for fc in rc.get("confidence", []):
+                c.confidence.append(FieldConfidence(
+                    fc.get("field_name", ""),
+                    fc.get("score", 0.0),
+                    fc.get("reason", ""),
+                ))
+            prov = rc.get("provenance")
+            if prov:
+                c.provenance = Provenance(
+                    source_document=prov.get("source_document", ""),
+                    source_section=prov.get("source_section", ""),
+                    source_text_snippet=prov.get("source_text_snippet", ""),
+                    extraction_timestamp=prov.get("extraction_timestamp", ""),
+                )
+            concepts.append(c)
+
+        relationships = []
+        for rr in raw.get("relationships", []):
+            r = Relationship(
+                subject=rr.get("subject", ""),
+                predicate=rr.get("predicate", ""),
+                object=rr.get("object", ""),
+            )
+            for fc in rr.get("confidence", []):
+                r.confidence.append(FieldConfidence(
+                    fc.get("field_name", ""),
+                    fc.get("score", 0.0),
+                    fc.get("reason", ""),
+                ))
+            relationships.append(r)
+
+        sa = DomainDocumentExtractionResult(
+            domain_name=raw.get("domain_name", ""),
+            concepts=concepts,
+            relationships=relationships,
+            source_documents=raw.get("source_documents", []),
+            extraction_timestamp=raw.get("extraction_timestamp", ""),
+        )
+        console.print(
+            f"[bold blue]Source A:[/] {len(concepts)} concepts, "
+            f"{len(relationships)} relationships from {source_a_json.name}"
+        )
+
+    if source_b_json:
+        from .extractors.governance_extractor import GovernanceExtractor
+        sb = GovernanceExtractor().extract_from_file(source_b_json)
+        console.print(
+            f"[bold blue]Source B:[/] {len(sb.records)} governance records "
+            f"from {source_b_json.name}"
+        )
+
+    if source_c_dir:
+        from .extractors.django_schema import DjangoSchemaParser
+        sc = DjangoSchemaParser(source_c_dir).parse()
+        console.print(
+            f"[bold blue]Source C:[/] {len(sc.models)} schema models "
+            f"from {source_c_dir}"
+        )
+
+    if source_d_dir:
+        from .extractors.code_extractor import CodeExtractor
+        sd = CodeExtractor().extract_from_directory(source_d_dir)
+        console.print(
+            f"[bold blue]Source D:[/] {len(sd.rules)} code rules "
+            f"from {source_d_dir}"
+        )
+
+    if not any([sa, sb, sc, sd]):
+        console.print("[red]No sources provided. Use --source-a, --source-b, "
+                      "--source-c, and/or --source-d.[/]")
+        raise typer.Exit(code=1)
+
+    # ── Fuse ──
+    priority_list = [p.strip().upper() for p in priority.split(",")]
+    engine = FusionEngine(priority_order=priority_list)
+    result = engine.fuse(source_a=sa, source_b=sb, source_c=sc, source_d=sd)
+
+    # ── Summary ──
+    console.print()
+    console.print(f"[bold green]Fused {len(result.elements)} elements[/] "
+                  f"from sources {'+'.join(result.sources_used)}")
+    console.print(
+        f"  Governance-validated: [cyan]{result.governance_validated_count}[/]   "
+        f"Conflicts: [yellow]{result.conflict_count}[/]   "
+        f"Relationships: [cyan]{len(result.relationships)}[/]"
+    )
+    if result.unmatched_governance:
+        console.print(
+            f"  [yellow]Governance-only (not in Source A): "
+            f"{len(result.unmatched_governance)}[/]"
+        )
+    if result.unmatched_schema_fields:
+        console.print(
+            f"  [yellow]Schema-only fields: "
+            f"{len(result.unmatched_schema_fields)}[/]"
+        )
+    if result.unmatched_code_rules:
+        console.print(
+            f"  [yellow]Unmatched code rules: "
+            f"{len(result.unmatched_code_rules)}[/]"
+        )
+
+    # ── Write output ──
+    out_data = {
+        "fusion_timestamp": result.fusion_timestamp,
+        "sources_used": result.sources_used,
+        "summary": {
+            "total_elements": len(result.elements),
+            "governance_validated": result.governance_validated_count,
+            "conflicts": result.conflict_count,
+            "relationships": len(result.relationships),
+            "unmatched_governance": len(result.unmatched_governance),
+            "unmatched_schema_fields": len(result.unmatched_schema_fields),
+            "unmatched_code_rules": len(result.unmatched_code_rules),
+        },
+        "elements": [
+            {
+                "element_name": el.element_name,
+                "domain_name": el.domain_name,
+                "definition": el.definition,
+                "is_critical": el.is_critical,
+                "citation": el.citation,
+                "data_type": el.data_type,
+                "enum_values": el.enum_values,
+                "business_rules": el.business_rules,
+                "governance_validated": el.governance_validated,
+                "confidence": round(el.confidence, 3),
+                "sources": el.sources,
+                "needs_review": el.needs_review(),
+                "conflicts": [
+                    {
+                        "field": c.field_name,
+                        "winner": {"source": c.winner.source, "value": c.winner.original_value},
+                        "rejected": [{"source": r.source, "value": r.original_value} for r in c.rejected],
+                        "resolution": c.resolution,
+                    }
+                    for c in el.conflicts
+                ],
+                "extra_fields": el.extra_fields,
+            }
+            for el in result.elements
+        ],
+        "relationships": [
+            {
+                "subject": r.subject,
+                "predicate": r.predicate,
+                "object": r.object,
+                "source": r.source,
+                "confidence": round(r.confidence, 3),
+            }
+            for r in result.relationships
+        ],
+    }
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(out_data, indent=2, default=str, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    console.print(f"[bold green]Fused dictionary saved:[/] {output}")
+
+    # ── Log ──
+    if domain_dir:
+        append_log(
+            domain_dir, "fuse",
+            sources="+".join(result.sources_used),
+            elements=len(result.elements),
+            governance_validated=result.governance_validated_count,
+            conflicts=result.conflict_count,
+            relationships=len(result.relationships),
+            output=str(output),
+        )
 
 
 def _enrich_with_definitions(result, doc: Path) -> tuple[int, int, int]:
@@ -742,14 +1484,14 @@ def refine(
         if renames:
             console.print(f"[yellow]Normalized {len(renames)} names:[/]")
             for old, new in renames.items():
-                console.print(f"  {old} → {new}")
+                console.print(f"  {old} -> {new}")
 
     if deduplicate:
         dupes = mgr.find_duplicates()
         if dupes:
             console.print("[yellow]Potential duplicates found:[/]")
             for a, b, score in dupes:
-                console.print(f"  {a} ↔ {b} (similarity: {score:.0%})")
+                console.print(f"  {a} <-> {b} (similarity: {score:.0%})")
         else:
             console.print("[green]No duplicates found.[/]")
 
